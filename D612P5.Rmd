@@ -1,0 +1,170 @@
+---
+title: "Project 5: Recommender Systems with Spark"
+subtitle: "DATA-612, Summer 2019"
+author: "Fernando Figueres Zeledon"
+output: html_notebook
+---
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(magrittr)
+library(sparklyr)
+
+conf <- spark_config()
+#conf$`sparklyr.cores.local` <- 1
+#conf$spark.executor.instances <- 1
+#conf$spark.dynamicAllocation.enabled <- "false"
+sc <- spark_connect(master = "local", config = conf)
+```
+
+```{r echo=TRUE}
+# source, https://stackoverflow.com/questions/50465390/gather-in-sparklyr
+sdf_gather <- function(tbl, gather_cols) {
+  other_cols <- colnames(tbl)[!colnames(tbl) %in% gather_cols]
+  
+  lapply(gather_cols, function(col_nm) {
+    tbl %>%
+      select(c(other_cols, col_nm)) %>%
+      mutate(item = col_nm) %>%
+      rename(ratingint = col_nm)
+  }) %>%
+    sdf_bind_rows() %>%
+    select(c(other_cols, 'item', 'ratingint'))
+}
+```
+
+```{r echo=TRUE }
+ratings <-
+  spark_read_csv(
+    sc,
+    name = 'ratings',
+    path = 'ratings.csv',
+    header = TRUE,
+    infer_schema = TRUE,
+    delimiter = ",",
+    quote = "\"",
+    escape = "\\",
+    charset = "UTF-8",
+    null_value = NULL,
+    options = list(),
+    repartition = 0,
+    memory = TRUE,
+    overwrite = TRUE
+  ) %>%
+  sdf_gather(c(
+    "Hamburger",
+    "Tacos" ,
+    "Soup"    ,
+    "Pizza",
+    "Pasta"  ,
+    "Salad"    ,
+    "Sandwich"
+  )) %>% 
+  filter(ratingint != 'NA') %>% 
+  sdf_random_split(training = 0.9, test = 0.1, seed = 1)
+  
+ratings$test %<>% 
+  mutate(data_cat = "test")
+
+ratings$training %<>% 
+  mutate(data_cat = "training")
+  
+ratings <- sdf_bind_rows(ratings$test,ratings$training)
+```
+
+```{r echo=TRUE }
+## Using your training data, calculate the raw average (mean) rating for every user-item combination.
+training_avg <- ratings %>% 
+  filter(data_cat == 'training') %>% 
+  summarise(tmean = mean(ratingint, na.rm = TRUE)) %>% 
+  pull()
+
+training_avg
+```
+
+```{r echo=TRUE }
+## Using your training data, calculate the raw average (mean) rating for every user-item combination.
+
+user_avgs <- ratings %>% 
+  filter(data_cat == 'training') %>% 
+  group_by(user) %>% 
+  summarise(user_avg = mean(ratingint, na.rm = TRUE)) %>% 
+  mutate(user_bias = user_avg - training_avg)
+
+user_avgs %>% 
+  kable(digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F)
+```
+
+```{r echo=TRUE }
+item_avgs <- ratings %>% 
+  filter(data_cat == 'training') %>% 
+  group_by(item) %>% 
+  summarise(item_avg = mean(ratingint, na.rm = TRUE)) %>% 
+  mutate(item_bias = item_avg - training_avg)
+
+item_avgs %>% 
+  kable(digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = F)
+```
+
+```{r echo=TRUE }
+## From the raw average, and the appropriate user and item biases, calculate the baseline predictors for every user-item combination.
+
+bl_pred_df <- full_join(item_avgs, user_avgs, by = character()) %>%
+  mutate(bl_predictor = item_bias + user_bias + training_avg) %>%
+  mutate(bl_predictor = pmax(pmin(bl_predictor, 5), 0)) %>%
+  select(item, user, bl_predictor)
+
+```
+
+```{r echo=TRUE }
+rmse <- ratings %>% 
+  left_join(bl_pred_df, by = c('user','item')) %>% 
+  mutate(sq_err_bl_pred = (ratingint-bl_predictor)**2) %>% 
+  mutate(sq_err_avg_pred = (ratingint-training_avg)**2)
+
+rmse %>% 
+  kable(col.names = c("User","Item","Rating","Category","Baseline","Baseline sq. error","Avg. sq. error")) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"),fixed_thead = T, full_width = F)
+```
+
+```{r echo=TRUE }
+rmse2 <- rmse %>%
+  select(sq_err_bl_pred, sq_err_avg_pred, data_cat) %>%
+  group_by(data_cat) %>% 
+  summarise(
+    rmse_bl = sqrt(mean(sq_err_bl_pred, na.rm = TRUE)), 
+    rmse_avg = sqrt(mean(sq_err_avg_pred, na.rm = TRUE))) %>% 
+  collect() %>% 
+  gather(error_type, rmse, rmse_bl:rmse_avg) 
+  
+```
+
+
+```{r echo=TRUE}
+ggplot(rmse2, aes(x = error_type, y = rmse, fill = error_type)) +
+  geom_bar(stat = "identity") +
+  facet_grid( ~ data_cat) +
+  scale_fill_brewer(palette = "Paired") +
+  labs(title = "RMSE by data group and predictor type",
+       subtitle = "The RMSE for both data groups is based on the avg. and bias values of the training data.",
+       caption = "") +
+  ylab("RMSE") +
+  theme_minimal() +
+  theme(legend.position = "none", axis.title.x = element_blank()) +
+  geom_text(aes(label = round(rmse, 2)),
+            vjust = 1.6,
+            color = "white",
+            size = 5) +
+  scale_x_discrete(labels = c("Avg. Rating \n (Training Data)", "Baseline Predictor"))
+```
+
+## Conclusions
+
+Despite the excellent integration provided by SparklyR, several functions like `gather` and `spread` are not directly compatible which required a significant rework of the code. 
+
+On a small data set such as this, it's unlikely that we'll see a substantial difference in performance .  Although it should be possible to select the number of cores and RAM available to Spark, those settings were not responsive, so it wasn't possible to compare the run time with different core count and RAM settings.
+
+If you expect that a recommender system will eventually process massive amounts of data that will require a distributed computing solution, then the development of the model should be implemented in Spark as early as possible.
